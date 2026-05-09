@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: astrasos-ai-service
+    env: python
+    buildCommand: "./render-build.sh"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    plan: starter # Whisper and Torch need at least 1GB RAM; the free tier (512MB) might crash.
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false

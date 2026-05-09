@@ -1,0 +1,29 @@
+# FastAPI & Server
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.0.0
+
+# Audio Processing
+faster-whisper>=0.10.0
+librosa>=0.10.0
+soundfile>=0.12.0
+audioread>=3.0.0
+imageio-ffmpeg>=0.5.0
+
+# ML / NLP
+torch>=2.0.0
+transformers>=4.37.0
+tokenizers>=0.15.0
+
+# Firebase (Legacy - being migrated to Supabase)
+firebase-admin>=6.0.0
+
+# Supabase
+supabase>=2.4.0
+python-dotenv>=1.0.0
+
+# HTTP / Utilities
+requests>=2.31.0
+numpy>=1.24.0
+# LLM
+groq>=0.9.0

@@ -1,0 +1,26 @@
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Firebase
+firebase-service-account.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+.htmlcov/
+
+# Data & Temp
+temp_incidents.json
+test_file.json
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
