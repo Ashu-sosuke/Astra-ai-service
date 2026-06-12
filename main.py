@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from schemas import IncidentInput, IncidentOutput
 from utils.audio_loader import AudioLoader, logger as audio_logger
@@ -10,6 +11,7 @@ from models.groq_filter import GroqFilter, logger as groq_logger
 from utils.supabase_client import supabase_client
 from utils.sms_client import sms_client
 from supabase import acreate_client
+from geocoding import reverse_geocode
 import logging
 import os
 from config import config
@@ -22,8 +24,8 @@ if config.OFFLINE_MODE:
 
 import uvicorn
 import time
-import threading
 import asyncio
+from contextlib import asynccontextmanager
 
 # Configure Logging
 logging.basicConfig(
@@ -32,23 +34,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-
-
 # Global models (loaded on startup)
 transcription_service = None
 audio_stress_detector = None
 threat_classifier = None
 groq_filter = None
 
+# Track background tasks to prevent "Event loop is closed" errors on shutdown
+_background_tasks = set()
+
 # Track incidents currently being processed to avoid duplicates
-_processing_lock = threading.Lock()
 _processing_set = set()
 
-
-def _run_pipeline(incident_id: str, audio_url: str, latitude: float = None,
-                  longitude: float = None, timestamp: int = None, document_path: str = None) -> dict:
+async def _run_pipeline_async(incident_id: str, audio_url: str, latitude: float = None,
+                              longitude: float = None, timestamp: int = None) -> dict:
     """
-    Core processing pipeline. Used by both the API endpoint and the Firestore listener.
+    Core processing pipeline (Asynchronous).
     Returns a dict with the full analysis results.
     """
     logger.info(f"▶ Pipeline started for incident: {incident_id}")
@@ -76,10 +77,12 @@ def _run_pipeline(incident_id: str, audio_url: str, latitude: float = None,
             logger.info(f"Processing segment {idx+1}/{len(all_urls)}: {url}")
             chunk_path = None
             try:
-                chunk_path = supabase_client.download_audio(url)
+                # Wrap blocking download in run_in_executor
+                loop = asyncio.get_event_loop()
+                chunk_path = await loop.run_in_executor(None, supabase_client.download_audio, url)
                 
-                # 2. Transcription
-                transcription_result = transcription_service.transcribe(chunk_path)
+                # 2. Transcription (Async)
+                transcription_result = await transcription_service.transcribe(chunk_path)
                 full_transcript.append(transcription_result["text"])
                 
                 # 3. Emotion/Stress Analysis
@@ -174,11 +177,11 @@ def _run_pipeline(incident_id: str, audio_url: str, latitude: float = None,
         logger.info(f"  - Stress: {stress_score}")
         logger.info(f"  - Threat: {threat_result['threat_type']} (conf={threat_result['confidence']})")
         logger.info(f"  - Fusion: {fusion_result['final_score']} ({fusion_result['severity_level']})")
-        logger.info(f"  - Location: lat={latitude}, lon={longitude}")
         
-        # 6. Save to Supabase Database
+        # 6. Save to Supabase Database (run blocking update in thread pool)
         logger.info("Step 6: Saving analysis results to Supabase...")
-        supabase_client.update_incident(incident_id, result)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, supabase_client.update_incident, incident_id, result)
 
         # 7. Notify Trusted Contacts (Cloud Backup SMS)
         try:
@@ -188,22 +191,28 @@ def _run_pipeline(incident_id: str, audio_url: str, latitude: float = None,
                 user_id = db_res.data[0].get("user_id")
                 db_is_emergency = db_res.data[0].get("is_emergency", False)
                 
-                contacts = supabase_client.get_user_contacts(user_id)
+                # Fetch contacts (uses crypto decryption, run in executor)
+                contacts = await loop.run_in_executor(None, supabase_client.get_user_contacts, user_id)
                 
                 if contacts:
                     logger.info(f"Found {len(contacts)} trusted contacts for user {user_id}")
                     severity = result.get("finalSeverity") or result.get("final_severity") or "UNKNOWN"
-                    summary = result.get("summary", "No summary available.")
                     ai_is_emergency = result.get("is_emergency", False)
                     
-                    # UPDATED: Always notify trusted contacts for any analyzed incident
                     should_notify = True
-                    
                     logger.info(f"Notification Logic: severity={severity}, ai_emergency={ai_is_emergency}, manual_emergency={db_is_emergency} -> should_notify={should_notify}")
                     
-                    # Alert if severity is high or explicitly an emergency
                     if should_notify:
-                        sms_msg = f"🚨 AstraSOS Alert: {severity} Emergency detected.\nSummary: {summary}\nTracking: https://astrasos-278a5.web.app/?incident={incident_id}"
+                        # FIX 7: Call Nominatim reverse-geocoding
+                        address = await reverse_geocode(latitude, longitude)
+                        threat_clean = threat_result.get("threat_type", "UNKNOWN")
+                        severity_clean = fusion_result.get("severity_level", "UNKNOWN")
+                        
+                        sms_msg = (
+                            f"🚨 SOS ALERT | Threat: {threat_clean} | Severity: {severity_clean}\n"
+                            f"📍 {address}\n"
+                            f"🔗 Track live: https://astrasos-278a5.web.app/?incident={incident_id}"
+                        )
                         
                         for contact in contacts:
                             notify = contact.get("notify_on_sos")
@@ -211,13 +220,14 @@ def _run_pipeline(incident_id: str, audio_url: str, latitude: float = None,
                                 phone = contact.get("phone_e164")
                                 if phone:
                                     logger.info(f"Sending Cloud SMS to {contact.get('name')} ({phone})")
-                                    sms_client.send_sms(phone, sms_msg)
+                                    # send_sms is quick, but wrapping it in thread is safe
+                                    await loop.run_in_executor(None, sms_client.send_sms, phone, sms_msg)
                                 else:
                                     logger.warning(f"Skipping contact {contact.get('name')}: No phone number found.")
                             else:
                                 logger.info(f"Skipping contact {contact.get('name')}: notify_on_sos is False.")
                     else:
-                        logger.info(f"Skipping SMS alerts: Incident severity ({severity}) is not HIGH/CRITICAL and is_emergency is False.")
+                        logger.info(f"Skipping SMS alerts: Incident severity ({severity}) is not high/critical.")
                 else:
                     logger.info(f"No trusted contacts found for user {user_id}. Skipping SMS alerts.")
             else:
@@ -230,9 +240,9 @@ def _run_pipeline(incident_id: str, audio_url: str, latitude: float = None,
 
     except Exception as e:
         logger.error(f"✘ Pipeline error for {incident_id}: {e}")
-        # Mark the incident as failed
         try:
-            supabase_client.update_incident(incident_id, {
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, supabase_client.update_incident, incident_id, {
                 "status": "FAILED",
                 "error_message": str(e)
             })
@@ -240,23 +250,20 @@ def _run_pipeline(incident_id: str, audio_url: str, latitude: float = None,
             pass
         raise
 
-    finally:
-        if temp_audio_path and os.path.exists(temp_audio_path):
-            try:
-                os.remove(temp_audio_path)
-            except Exception:
-                pass
-
-
-def _process_from_supabase(doc_id: str, doc_data: dict):
+def _run_pipeline(incident_id: str, audio_url: str, latitude: float = None,
+                  longitude: float = None, timestamp: int = None) -> dict:
     """
-    Called by the Supabase listener when a new/updated incident is detected.
-    FIX: Removed old status-based gating; on_change now handles audio_url gating.
+    Synchronous wrapper for _run_pipeline_async (used by batch script process_all.py).
     """
-    with _processing_lock:
-        if doc_id in _processing_set:
-            return
-        _processing_set.add(doc_id)
+    return asyncio.run(_run_pipeline_async(incident_id, audio_url, latitude, longitude, timestamp))
+
+async def _process_from_supabase_async(doc_id: str, doc_data: dict):
+    """
+    Asynchronous runner for Supabase database changes.
+    """
+    if doc_id in _processing_set:
+        return
+    _processing_set.add(doc_id)
 
     try:
         audio_url = doc_data.get("audio_url") or doc_data.get("audioUrl") or ""
@@ -264,73 +271,69 @@ def _process_from_supabase(doc_id: str, doc_data: dict):
         longitude = doc_data.get("longitude")
         timestamp = doc_data.get("timestamp")
 
-        # FIX: Clear log showing doc_id and first 60 chars of audio_url
-        logger.info(f"🧵 Thread processing incident {doc_id} | Audio: {audio_url[:60]}...")
-
-        _run_pipeline(doc_id, audio_url, latitude, longitude, timestamp)
+        logger.info(f"🚀 Async task processing incident {doc_id} | Audio: {audio_url[:60]}...")
+        await _run_pipeline_async(doc_id, audio_url, latitude, longitude, timestamp)
 
     except Exception as e:
         logger.error(f"Supabase-triggered processing failed for {doc_id}: {e}")
     finally:
-        with _processing_lock:
-            _processing_set.discard(doc_id)
-
+        _processing_set.discard(doc_id)
 
 async def _start_supabase_listener():
     """
     Starts a real-time Supabase listener on the incidents table with retry logic.
     Falls back to polling mode if WebSocket connection repeatedly fails.
     """
-    from config import config
     if not config.SUPABASE_URL or not config.SUPABASE_KEY:
         logger.warning("Supabase credentials missing — cannot start listener.")
         return
 
     retry_delay = 5
     consecutive_failures = 0
-    FALLBACK_THRESHOLD = 3  # Switch to polling after 3 consecutive WebSocket failures
+    FALLBACK_THRESHOLD = 3
 
     while True:
-        # If too many WebSocket failures, use REST polling instead
         if consecutive_failures >= FALLBACK_THRESHOLD:
             logger.warning(f"⚠ WebSocket failed {consecutive_failures} times. Switching to REST POLLING mode...")
             await _polling_listener()
-            return  # polling_listener runs forever, so this won't return normally
+            return
 
         try:
             async_client = await acreate_client(config.SUPABASE_URL, config.SUPABASE_KEY)
             
             def on_change(payload):
-                logger.info(f"🔔 Realtime change detected: {payload}")
-                raw_type = payload.get("data", {}).get("type") or payload.get("eventType")
-                event_type = str(raw_type).upper() if raw_type else ""
-                
-                if "INSERT" in event_type or "UPDATE" in event_type:
-                    new_data = payload.get("data", {}).get("record") or payload.get("new", {})
-                    doc_id = str(new_data.get("id"))
-                    audio_url = new_data.get("audio_url") or new_data.get("audioUrl")
-                    status = new_data.get("status")
+                try:
+                    logger.info(f"🔔 Realtime change detected: {payload}")
+                    raw_type = payload.get("data", {}).get("type") or payload.get("eventType")
+                    event_type = str(raw_type).upper() if raw_type else ""
+                    
+                    if "INSERT" in event_type or "UPDATE" in event_type:
+                        new_data = payload.get("data", {}).get("record") or payload.get("new", {})
+                        doc_id = str(new_data.get("id"))
+                        audio_url = new_data.get("audio_url") or new_data.get("audioUrl")
+                        status = new_data.get("status")
 
-                    if audio_url:
-                        if status == "ANALYZED":
-                            logger.info(f"✅ Skipping {doc_id}: Already analyzed.")
-                            return
-                        logger.info(f"🚀 Audio URL found! ID: {doc_id} | Status: {status} | URL: {audio_url[:60]}...")
-                        thread = threading.Thread(
-                            target=_process_from_supabase,
-                            args=(doc_id, new_data),
-                            daemon=True
-                        )
-                        thread.start()
-                    else:
-                        logger.info(f"⏳ Skipping {doc_id}: audio_url is missing (waiting for upload).")
+                        if audio_url:
+                            if status == "ANALYZED":
+                                logger.info(f"✅ Skipping {doc_id}: Already analyzed.")
+                                return
+                            logger.info(f"🚀 Audio URL found! ID: {doc_id} | Status: {status} | URL: {audio_url[:60]}...")
+                            
+                            # Replace raw thread with asyncio task registered in background tasks
+                            task = asyncio.create_task(_process_from_supabase_async(doc_id, new_data))
+                            _background_tasks.add(task)
+                            task.add_done_callback(_background_tasks.discard)
+                        else:
+                            logger.info(f"⏳ Skipping {doc_id}: audio_url is missing (waiting for upload).")
+                except Exception as cb_err:
+                    logger.error(f"Error in on_change callback: {cb_err}")
 
             channel = async_client.channel("db-changes")
             channel.on_postgres_changes(event="*", schema="public", table="incidents", callback=on_change)
             await channel.subscribe()
             
             logger.info("👁 Subscribed to Supabase Realtime (WebSocket) successfully.")
-            consecutive_failures = 0  # Reset on success
+            consecutive_failures = 0  # Reset
             
             # Keep alive
             while True:
@@ -347,41 +350,37 @@ async def _start_supabase_listener():
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 60)
 
-
 async def _polling_listener():
     """
     REST API polling fallback. Polls Supabase every 10s for new READY_FOR_ANALYSIS incidents.
-    Works even when WebSocket/Realtime is blocked by firewalls or DNS issues.
     """
     logger.info("🔄 POLLING MODE ACTIVE — Checking Supabase REST API every 10s for new incidents...")
-    POLL_INTERVAL = 10  # seconds
+    POLL_INTERVAL = 10
 
     while True:
         try:
-            # Fetch all incidents that are READY_FOR_ANALYSIS and have an audio_url
-            response = supabase_client.client.table("incidents") \
-                .select("id, audio_url, latitude, longitude, timestamp, status") \
-                .eq("status", "READY_FOR_ANALYSIS") \
-                .not_.is_("audio_url", "null") \
-                .execute()
+            # Run blocking supabase REST call in thread executor
+            loop = asyncio.get_event_loop()
+            def fetch_pending():
+                return supabase_client.client.table("incidents") \
+                    .select("id, audio_url, latitude, longitude, timestamp, status") \
+                    .eq("status", "READY_FOR_ANALYSIS") \
+                    .not_.is_("audio_url", "null") \
+                    .execute()
+                    
+            response = await loop.run_in_executor(None, fetch_pending)
 
             if response.data:
                 for incident in response.data:
                     doc_id = str(incident.get("id"))
-                    audio_url = incident.get("audio_url")
-
-                    # Skip if already being processed
-                    with _processing_lock:
-                        if doc_id in _processing_set:
-                            continue
+                    
+                    if doc_id in _processing_set:
+                        continue
 
                     logger.info(f"📡 POLL: Found unanalyzed incident {doc_id} — queuing...")
-                    thread = threading.Thread(
-                        target=_process_from_supabase,
-                        args=(doc_id, incident),
-                        daemon=True
-                    )
-                    thread.start()
+                    task = asyncio.create_task(_process_from_supabase_async(doc_id, incident))
+                    _background_tasks.add(task)
+                    task.add_done_callback(_background_tasks.discard)
             else:
                 logger.debug("📡 POLL: No new incidents found.")
 
@@ -389,10 +388,6 @@ async def _polling_listener():
             logger.error(f"📡 POLL error: {e}")
 
         await asyncio.sleep(POLL_INTERVAL)
-
-
-
-from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -408,24 +403,44 @@ async def lifespan(app: FastAPI):
         logger.critical(f"Model initialization failed: {e}")
         raise e
 
+    # Explicit startup initialization of Supabase client
+    if supabase_client.client is None:
+        logger.info("Initializing Supabase client on startup...")
+        supabase_client._initialize()
+    logger.info("AI Service ready")
+
     # Start the Supabase real-time listener as a background task if enabled
-    listener_task = None
     if config.ENABLE_REALTIME_LISTENER:
         logger.info("Starting Supabase Realtime Listener...")
         listener_task = asyncio.create_task(_start_supabase_listener())
+        _background_tasks.add(listener_task)
+        listener_task.add_done_callback(_background_tasks.discard)
     else:
         logger.info("Supabase Realtime Listener is DISABLED (ENABLE_REALTIME_LISTENER=False)")
     
     yield
     
-    # Shutdown: Cancel the listener task to avoid "Event loop is closed" errors
-    if listener_task:
-        logger.info("Shutting down: cancelling Supabase listener...")
-        listener_task.cancel()
+    # Shutdown: Cancel all tracked background tasks to avoid "Event loop is closed" errors
+    logger.info("Shutting down AI Service: gathering active background tasks...")
+    if _background_tasks:
+        task_count = len(_background_tasks)
+        logger.info(f"Cancelling {task_count} active background tasks...")
+        for task in list(_background_tasks):
+            task.cancel()
+            
         try:
-            await listener_task
-        except asyncio.CancelledError:
-            logger.info("Supabase listener task cancelled successfully.")
+            # Wait with a 5-second timeout for cleanup
+            await asyncio.wait_for(
+                asyncio.gather(*list(_background_tasks), return_exceptions=True),
+                timeout=5.0
+            )
+            logger.info("Background tasks cleaned up successfully.")
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for background tasks to terminate during shutdown.")
+            
+        cancelled = sum(1 for t in _background_tasks if t.cancelled())
+        completed = len(_background_tasks) - cancelled
+        logger.info(f"Shutdown complete. Tasks cancelled: {cancelled}, completed: {completed}")
 
 app = FastAPI(title="SOS Intelligence AI Service", version="1.0.0", lifespan=lifespan)
 
@@ -434,37 +449,95 @@ if not os.path.exists("static"):
     os.makedirs("static")
 app.mount("/admin", StaticFiles(directory="static", html=True), name="static")
 
+# Middleware: API Key verification for `/api/*` routes
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api/"):
+        secret_key = config.AI_SERVICE_SECRET_KEY
+        client_key = request.headers.get("X-Service-Key")
+        if not secret_key or client_key != secret_key:
+            logger.warning(f"Unauthorized API request blocked to {request.url.path} from host {request.client.host}")
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    response = await call_next(request)
+    return response
 
 @app.get("/health")
 def health_check():
     """Health check endpoint for Cloud Run."""
     if not (transcription_service and audio_stress_detector and threat_classifier):
         raise HTTPException(status_code=503, detail="Models not fully loaded")
-    return {"status": "healthy", "version": "1.0.0"}
+        
+    backend = "groq" if (transcription_service.groq_whisper and config.GROQ_API_KEY) else "local"
+    return {
+        "status": "healthy", 
+        "version": "1.0.0",
+        "transcription_backend": backend
+    }
 
 @app.get("/api/incidents")
-def get_incidents():
-    """Retrieve all incidents from Supabase."""
-    incidents = supabase_client.get_all_incidents()
-    return {"incidents": incidents}
+async def get_incidents(status: str = None, limit: int = 20, offset: int = 0):
+    """Retrieve filtered, paginated list of incidents from Supabase with safety restrictions."""
+    if not supabase_client.client:
+        raise HTTPException(status_code=503, detail="Supabase client not initialized")
+    try:
+        # Request only safe columns. Never expose phone, email, user_id, or audio_url.
+        query = supabase_client.client.table("incidents").select(
+            "id, status, threat_type, severity_score, services_needed, created_at"
+        )
+        if status:
+            query = query.ilike("status", status)
+            
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(
+            None,
+            lambda: query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+        )
+        return {"incidents": res.data}
+    except Exception as e:
+        logger.error(f"Error fetching incidents API: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+_last_process_all_time = 0.0
 
 @app.post("/api/process-all")
 async def trigger_process_all(background_tasks: BackgroundTasks):
-    """Triggers batch processing of all pending incidents."""
-    from process_all import process_all_pending
-    background_tasks.add_task(process_all_pending)
-    return {"message": "Batch processing started in background"}
+    """Triggers batch processing of all pending incidents with rate limiting."""
+    global _last_process_all_time
+    now = time.time()
+    if now - _last_process_all_time < 30.0:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait 30 seconds.")
+    _last_process_all_time = now
+    
+    if not supabase_client.client:
+        raise HTTPException(status_code=503, detail="Supabase client not initialized")
+        
+    try:
+        # Get count of pending/failed/unanalyzed incidents in thread
+        loop = asyncio.get_event_loop()
+        def check_pending():
+            return supabase_client.client.table("incidents").select("id").not_.in_("status", ["ANALYZED", "FAILED"]).execute()
+            
+        res = await loop.run_in_executor(None, check_pending)
+        pending_count = len(res.data) if res.data else 0
+        
+        # Trigger processing in the background (FastAPI thread pool)
+        from process_all import process_all_pending
+        background_tasks.add_task(process_all_pending)
+        
+        return {"queued": pending_count}
+    except Exception as e:
+        logger.error(f"Error triggering batch processing: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/process-incident", response_model=IncidentOutput)
 async def process_incident(incident: IncidentInput, background_tasks: BackgroundTasks):
     """
     Manual processing endpoint for SOS incidents.
-    Also used as a fallback if the Firestore listener is not active.
     """
     logger.info(f"Received manual processing request for incident: {incident.incidentId}")
 
     try:
-        result = _run_pipeline(
+        result = await _run_pipeline_async(
             incident_id=incident.incidentId,
             audio_url=incident.audioUrl,
             latitude=incident.latitude,

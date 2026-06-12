@@ -136,93 +136,145 @@ class SupabaseClient:
     def update_incident(self, incident_id: str, analysis_data: dict) -> bool:
         """
         Updates the incident record in Postgres with AI analysis results.
-        Supports both the new schema and the legacy schema via fallback.
-        Ensures ALL scores and metadata are saved.
+        Matches the LIVE database schema and gracefully handles column mismatches.
         """
         if not self.client:
             logger.error("Supabase client is uninitialized.")
             return False
 
-        # 1. ATTEMPT NEW SCHEMA (Primary) with Retries
+        import json
+
+        # ── Build payload matching live DB columns ────────────────────────────
+        stress_val = analysis_data.get("stress_score") or analysis_data.get("stressScore")
+        severity_val = analysis_data.get("severity_score") or analysis_data.get("severityScore")
+        threat_val = analysis_data.get("threat_type") or analysis_data.get("threatType")
+        final_sev = analysis_data.get("final_severity") or analysis_data.get("finalSeverity")
+        rec_action = analysis_data.get("recommended_action") or analysis_data.get("recommendedAction")
+        transcript_val = analysis_data.get("transcript")
+
+        # Extract processing_time from nested details or top-level
+        processing_time = analysis_data.get("processing_time_sec")
+        details_dict = analysis_data.get("details")
+        if processing_time is None and isinstance(details_dict, dict):
+            processing_time = details_dict.get("processing_time_sec")
+
+        payload = {
+            "status": analysis_data.get("status", "ANALYZED"),
+            "updated_at": "now()",
+            "last_updated": "now()",
+        }
+
+        # Text fields (both new and legacy aliases)
+        if transcript_val is not None:
+            payload["transcript"] = transcript_val
+            payload["transcription"] = transcript_val  # legacy alias
+
+        if analysis_data.get("summary") is not None:
+            payload["summary"] = analysis_data["summary"]
+
+        if analysis_data.get("intent") is not None:
+            payload["intent"] = analysis_data["intent"]
+
+        if analysis_data.get("error_message") is not None:
+            payload["error_message"] = analysis_data["error_message"]
+
+        if rec_action is not None:
+            payload["recommended_action"] = rec_action
+
+        if threat_val is not None:
+            payload["threat_type"] = threat_val
+
+        if final_sev is not None:
+            payload["final_severity"] = final_sev
+
+        # Numeric fields (both new and legacy aliases)
+        if stress_val is not None:
+            payload["stress_score"] = float(stress_val)
+            payload["stress_level"] = str(stress_val)  # legacy alias
+
+        if severity_val is not None:
+            payload["fusion_score"] = float(severity_val)  # live DB column name
+
+        if analysis_data.get("confidence") is not None:
+            payload["confidence"] = float(analysis_data["confidence"])
+
+        if processing_time is not None:
+            payload["processing_time_sec"] = float(processing_time)
+
+        if analysis_data.get("latitude") is not None:
+            payload["latitude"] = float(analysis_data["latitude"])
+
+        if analysis_data.get("longitude") is not None:
+            payload["longitude"] = float(analysis_data["longitude"])
+
+        # Boolean fields
+        if analysis_data.get("is_emergency") is not None:
+            payload["is_emergency"] = bool(analysis_data["is_emergency"])
+
+        if analysis_data.get("is_override_triggered") is not None:
+            payload["is_override_triggered"] = bool(analysis_data["is_override_triggered"])
+
+        # JSONB / complex fields
+        if details_dict is not None:
+            # Serialize to JSON string for the JSONB column
+            try:
+                payload["details"] = json.dumps(details_dict) if isinstance(details_dict, dict) else details_dict
+            except (TypeError, ValueError):
+                pass
+
+        # Optional new columns (may not exist yet on live DB)
+        optional_columns = {}
+        services_needed = analysis_data.get("services_needed")
+        if services_needed is not None:
+            optional_columns["services_needed"] = json.dumps(services_needed) if isinstance(services_needed, list) else services_needed
+
+        secondary_threats = analysis_data.get("secondary_threats")
+        if secondary_threats is not None:
+            optional_columns["secondary_threats"] = json.dumps(secondary_threats) if isinstance(secondary_threats, list) else secondary_threats
+
+        if analysis_data.get("situation_details") is not None:
+            optional_columns["situation_details"] = analysis_data["situation_details"]
+
+        if analysis_data.get("victim_count") is not None:
+            optional_columns["victim_count"] = int(analysis_data["victim_count"])
+
+        if analysis_data.get("model_version") is not None:
+            optional_columns["model_version"] = analysis_data["model_version"]
+
+        # ── Execute Update ────────────────────────────────────────────────────
+        # First try with all columns (core + optional)
+        full_payload = {**payload, **optional_columns}
+        logger.info(f"Updating incident {incident_id} with {len(full_payload)} fields: {list(full_payload.keys())}")
+
         for attempt in range(2):
             try:
-                new_payload = {
-                    "transcript": analysis_data.get("transcript"),
-                    "stress_score": analysis_data.get("stress_score") or analysis_data.get("stressScore"),
-                    "threat_type": analysis_data.get("threat_type") or analysis_data.get("threatType"),
-                    "severity_score": analysis_data.get("severity_score") or analysis_data.get("severityScore"),
-                    "final_severity": analysis_data.get("final_severity") or analysis_data.get("finalSeverity"),
-                    "confidence": analysis_data.get("confidence"),
-                    "recommended_action": analysis_data.get("recommended_action") or analysis_data.get("recommendedAction"),
-                    "summary": analysis_data.get("summary"),
-                    "is_emergency": analysis_data.get("is_emergency"),
-                    "intent": analysis_data.get("intent"),
-                    "services_needed": analysis_data.get("services_needed"),
-                    "situation_details": analysis_data.get("situation_details"),
-                    "victim_count": analysis_data.get("victim_count"),
-                    "processing_time_sec": analysis_data.get("details", {}).get("processing_time_sec"),
-                    "model_version": analysis_data.get("model_version", "v3.0.0"),
-                    "is_override_triggered": analysis_data.get("is_override_triggered", False),
-                    "latitude": analysis_data.get("latitude"),
-                    "longitude": analysis_data.get("longitude"),
-                    "timestamp": analysis_data.get("timestamp"),
-                    "details": analysis_data.get("details"),
-                    "status": "ANALYZED",
-                    "updated_at": "now()"
-                }
-                
-                res = self.client.table("incidents").update(new_payload).eq("id", incident_id).execute()
-                if not res.data:
-                    # Try by incident_id if id fails
-                    res = self.client.table("incidents").update(new_payload).eq("incident_id", incident_id).execute()
-                
+                current_payload = full_payload if attempt == 0 else payload
+                if attempt == 1:
+                    logger.info(f"Retry with core-only payload ({len(payload)} fields)")
+
+                res = self.client.table("incidents").update(current_payload).eq("id", incident_id).execute()
+
                 if res.data:
-                    logger.info(f"Updated Supabase record {incident_id} successfully (NEW schema).")
+                    logger.info(f"Updated Supabase record {incident_id} successfully ({len(current_payload)} fields).")
                     return True
-                break
+                else:
+                    logger.warning(f"Update returned no data for {incident_id}. Record may not exist.")
+                    return False
+
             except Exception as e:
                 err_str = str(e)
-                if "PGRST204" in err_str or "column" in err_str.lower():
-                    logger.warning(f"New schema update failed for {incident_id} (missing columns). Attempting legacy fallback...")
-                    break # Go to legacy fallback
-                
-                logger.warning(f"Attempt {attempt+1} failed to update Supabase record (New Schema): {e}")
-                if attempt == 0:
-                    self._initialize() # Re-init client
-                continue
+                if "column" in err_str.lower() and "does not exist" in err_str.lower():
+                    logger.warning(f"Column mismatch on attempt {attempt+1}: {err_str[:120]}")
+                    # Fall through to retry with core-only payload
+                    continue
+                else:
+                    logger.error(f"Attempt {attempt+1} failed to update incident {incident_id}: {e}")
+                    if attempt == 0:
+                        self._initialize()
+                    continue
 
-        # 2. FALLBACK TO LEGACY SCHEMA
-        try:
-            legacy_payload = {
-                "transcription": analysis_data.get("transcript"),
-                "stress_level": str(analysis_data.get("stress_score") or analysis_data.get("stressScore")),
-                "threat_type": analysis_data.get("threat_type") or analysis_data.get("threatType"),
-                "fusion_score": analysis_data.get("severity_score") or analysis_data.get("severityScore"),
-                "final_severity": analysis_data.get("final_severity") or analysis_data.get("finalSeverity"),
-                "recommended_action": analysis_data.get("recommended_action") or analysis_data.get("recommendedAction"),
-                "summary": analysis_data.get("summary"),
-                "intent": analysis_data.get("intent"),
-                "confidence": analysis_data.get("confidence"),
-                "is_emergency": analysis_data.get("is_emergency"),
-                "latitude": analysis_data.get("latitude"),
-                "longitude": analysis_data.get("longitude"),
-                "status": "ANALYZED",
-                "last_updated": "now()"
-            }
-            
-            res = self.client.table("incidents").update(legacy_payload).eq("id", incident_id).execute()
-            if not res.data:
-                res = self.client.table("incidents").update(legacy_payload).eq("incident_id", incident_id).execute()
-            
-            if res.data:
-                logger.info(f"Updated Supabase record {incident_id} using LEGACY schema.")
-                return True
-            else:
-                logger.error(f"No record found to update for {incident_id} in either schema.")
-                return False
-        except Exception as e:
-            logger.error(f"Critical failure updating Supabase record (Legacy Fallback): {e}")
-            return False
+        logger.error(f"All attempts to update incident {incident_id} have failed.")
+        return False
 
     def get_user_contacts(self, user_id: str) -> list:
         """

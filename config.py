@@ -27,6 +27,10 @@ class Config:
     # Groq Settings
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    GROQ_WHISPER = os.getenv("GROQ_WHISPER", "False").lower() == "true"
+    
+    # API Security Settings
+    AI_SERVICE_SECRET_KEY = os.getenv("AI_SERVICE_SECRET_KEY")
 
     # Legacy Ollama Settings
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
